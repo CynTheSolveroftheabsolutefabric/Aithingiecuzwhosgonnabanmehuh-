@@ -42,6 +42,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Verify installation.
+          command -v opencode
+          opencode --version
+          ttyd --version
+          cloudflared --version
+
           if [ -z "$TTYD_PASSWORD" ]; then
             echo "Missing TTYD_PASSWORD repository secret."
             exit 1
@@ -50,13 +56,13 @@ jobs:
           export TERM=xterm-256color
           export COLORTERM=truecolor
 
-          # Start OpenCode in a writable web terminal.
+          # Start OpenCode inside a real pseudo-terminal.
           ttyd \
             --writable \
             --port 7681 \
             --credential "opencode:${TTYD_PASSWORD}" \
             --terminal-type xterm-256color \
-            bash -lc 'exec opencode' &
+            script -q -c "opencode" /dev/null &
 
           TTYD_PID=$!
 
@@ -68,10 +74,10 @@ jobs:
 
           TUNNEL_PID=$!
 
-          # Wait for the public URL.
-          echo "Waiting for Cloudflare tunnel..."
-
+          # Wait for Cloudflare to generate a public URL.
           URL=""
+
+          echo "Waiting for Cloudflare tunnel..."
 
           for i in $(seq 1 60); do
             URL=$(grep -oE \
@@ -83,7 +89,7 @@ jobs:
             fi
 
             if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo "Cloudflare tunnel stopped unexpectedly."
+              echo "Cloudflare exited unexpectedly."
               cat cloudflared.log
               exit 1
             fi
@@ -97,25 +103,39 @@ jobs:
             exit 1
           fi
 
+          # Display connection information.
           echo ""
-          echo "======================================"
-          echo "OpenCode is available at:"
-          echo "$URL"
-          echo "======================================"
-          echo ""
+          echo "=========================================="
+          echo "OpenCode Cloud Terminal is ready!"
+          echo "=========================================="
+          echo "URL: $URL"
           echo "Username: opencode"
-          echo "Password: configured in TTYD_PASSWORD"
+          echo "Password: your TTYD_PASSWORD secret"
+          echo "=========================================="
           echo ""
-          echo "Terminal is running."
 
-          # Keep the job alive while both processes are running.
-          while kill -0 "$TTYD_PID" 2>/dev/null && \
-                kill -0 "$TUNNEL_PID" 2>/dev/null; do
+          # Keep the workflow alive while both services run.
+          while true; do
+            if ! kill -0 "$TTYD_PID" 2>/dev/null; then
+              echo "ttyd stopped unexpectedly."
+              break
+            fi
+
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo "Cloudflare stopped unexpectedly."
+              break
+            fi
+
             sleep 5
           done
 
-          echo "OpenCode or Cloudflare stopped."
+          # Print diagnostic logs.
+          echo ""
+          echo "========== CLOUDFLARE LOGS =========="
+          cat cloudflared.log
 
-          kill "$TTYD_PID" "$TUNNEL_PID" 2>/dev/null || true
+          echo ""
+          echo "========== PROCESS STATUS =========="
+          ps aux
 
           exit 1
