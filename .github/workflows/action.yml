@@ -1,0 +1,93 @@
+
+name: OpenCode Cloud Terminal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  opencode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ttyd curl
+
+      - name: Install OpenCode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Install Cloudflared
+        run: |
+          curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o cloudflared
+
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+
+      - name: Start OpenCode and Cloudflare Tunnel
+        env:
+          TTYD_PASSWORD: ${{ secrets.TTYD_PASSWORD }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -e
+
+          # Create a terminal session for OpenCode
+          ttyd \
+            -W \
+            -p 7681 \
+            -c "opencode:${TTYD_PASSWORD}" \
+            bash -lc 'exec opencode' &
+
+          TTYD_PID=$!
+
+          # Start the Cloudflare Quick Tunnel
+          cloudflared tunnel \
+            --url http://localhost:7681 \
+            --no-autoupdate \
+            > cloudflared.log 2>&1 &
+
+          TUNNEL_PID=$!
+
+          # Wait for the public URL
+          echo "Waiting for Cloudflare tunnel..."
+
+          for i in $(seq 1 60); do
+            URL=$(grep -oE \
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              cloudflared.log | head -n 1 || true)
+
+            if [ -n "$URL" ]; then
+              echo ""
+              echo "======================================"
+              echo "OpenCode is available at:"
+              echo "$URL"
+              echo "======================================"
+              echo ""
+              echo "Username: opencode"
+              echo "Password: your TTYD_PASSWORD secret"
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            echo "Failed to obtain Cloudflare URL"
+            cat cloudflared.log
+            exit 1
+          fi
+
+          # Keep the workflow alive while the terminal is running
+          tail -f /dev/null
