@@ -19,12 +19,11 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ttyd curl
+          sudo apt-get install -y ttyd curl python3
 
       - name: Install OpenCode
         run: |
           curl -fsSL https://opencode.ai/install | bash
-
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
 
       - name: Install Cloudflared
@@ -42,42 +41,63 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Verify installation.
-          command -v opencode
-          opencode --version
-          ttyd --version
-          cloudflared --version
-
           if [ -z "$TTYD_PASSWORD" ]; then
-            echo "Missing TTYD_PASSWORD repository secret."
+            echo "Missing TTYD_PASSWORD secret."
             exit 1
           fi
 
           export TERM=xterm-256color
           export COLORTERM=truecolor
 
-          # Start OpenCode inside a real pseudo-terminal.
+          # Find an available TCP port automatically.
+          PORT=$(python3 -c '
+          import socket
+          s = socket.socket()
+          s.bind(("127.0.0.1", 0))
+          print(s.getsockname()[1])
+          s.close()
+          ')
+
+          echo "Selected port: $PORT"
+
+          # Start OpenCode in ttyd.
           ttyd \
             --writable \
-            --port 7681 \
+            --port "$PORT" \
             --credential "opencode:${TTYD_PASSWORD}" \
             --terminal-type xterm-256color \
-            script -q -c "opencode" /dev/null &
+            opencode &
 
           TTYD_PID=$!
 
-          # Start Cloudflare Quick Tunnel.
+          # Wait for ttyd to become available.
+          echo "Waiting for ttyd..."
+
+          for i in $(seq 1 30); do
+            if curl -fsS \
+              http://127.0.0.1:"$PORT" \
+              -o /dev/null; then
+              break
+            fi
+
+            if ! kill -0 "$TTYD_PID" 2>/dev/null; then
+              echo "ttyd failed to start."
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          # Start Cloudflare Quick Tunnel on the selected port.
           cloudflared tunnel \
-            --url http://localhost:7681 \
+            --url "http://127.0.0.1:${PORT}" \
             --no-autoupdate \
             > cloudflared.log 2>&1 &
 
           TUNNEL_PID=$!
 
-          # Wait for Cloudflare to generate a public URL.
+          # Wait for the Cloudflare URL.
           URL=""
-
-          echo "Waiting for Cloudflare tunnel..."
 
           for i in $(seq 1 60); do
             URL=$(grep -oE \
@@ -103,38 +123,26 @@ jobs:
             exit 1
           fi
 
-          # Display connection information.
           echo ""
-          echo "=========================================="
+          echo "======================================"
           echo "OpenCode Cloud Terminal is ready!"
-          echo "=========================================="
           echo "URL: $URL"
+          echo "Port: $PORT"
           echo "Username: opencode"
           echo "Password: your TTYD_PASSWORD secret"
-          echo "=========================================="
-          echo ""
+          echo "======================================"
 
-          # Keep the workflow alive while both services run.
-          while true; do
-            if ! kill -0 "$TTYD_PID" 2>/dev/null; then
-              echo "ttyd stopped unexpectedly."
-              break
-            fi
-
-            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo "Cloudflare stopped unexpectedly."
-              break
-            fi
-
+          # Keep the workflow running.
+          while kill -0 "$TTYD_PID" 2>/dev/null && \
+                kill -0 "$TUNNEL_PID" 2>/dev/null; do
             sleep 5
           done
 
-          # Print diagnostic logs.
-          echo ""
+          echo "A service stopped unexpectedly."
+
           echo "========== CLOUDFLARE LOGS =========="
           cat cloudflared.log
 
-          echo ""
           echo "========== PROCESS STATUS =========="
           ps aux
 
