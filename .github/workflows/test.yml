@@ -1,0 +1,149 @@
+
+name: OpenCode Cloud Terminal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  opencode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ttyd curl python3
+
+      - name: Install OpenCode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Install Cloudflared
+        run: |
+          curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o cloudflared
+
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+
+      - name: Start OpenCode and Cloudflare Tunnel
+        env:
+          TTYD_PASSWORD: ${{ secrets.TTYD_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$TTYD_PASSWORD" ]; then
+            echo "Missing TTYD_PASSWORD secret."
+            exit 1
+          fi
+
+          export TERM=xterm-256color
+          export COLORTERM=truecolor
+
+          # Find an available TCP port automatically.
+          PORT=$(python3 -c '
+          import socket
+          s = socket.socket()
+          s.bind(("127.0.0.1", 0))
+          print(s.getsockname()[1])
+          s.close()
+          ')
+
+          echo "Selected port: $PORT"
+
+          # Start OpenCode in ttyd.
+          ttyd \
+            --writable \
+            --port "$PORT" \
+            --credential "opencode:${TTYD_PASSWORD}" \
+            --terminal-type xterm-256color \
+            opencode &
+
+          TTYD_PID=$!
+
+          # Wait for ttyd to become available.
+          echo "Waiting for ttyd..."
+
+          for i in $(seq 1 30); do
+            if curl -fsS \
+              http://127.0.0.1:"$PORT" \
+              -o /dev/null; then
+              break
+            fi
+
+            if ! kill -0 "$TTYD_PID" 2>/dev/null; then
+              echo "ttyd failed to start."
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          # Start Cloudflare Quick Tunnel on the selected port.
+          cloudflared tunnel \
+            --url "http://127.0.0.1:${PORT}" \
+            --no-autoupdate \
+            > cloudflared.log 2>&1 &
+
+          TUNNEL_PID=$!
+
+          # Wait for the Cloudflare URL.
+          URL=""
+
+          for i in $(seq 1 60); do
+            URL=$(grep -oE \
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              cloudflared.log | head -n 1 || true)
+
+            if [ -n "$URL" ]; then
+              break
+            fi
+
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo "Cloudflare exited unexpectedly."
+              cat cloudflared.log
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            echo "Failed to obtain Cloudflare URL."
+            cat cloudflared.log
+            exit 1
+          fi
+
+          echo ""
+          echo "======================================"
+          echo "OpenCode Cloud Terminal is ready!"
+          echo "URL: $URL"
+          echo "Port: $PORT"
+          echo "Username: opencode"
+          echo "Password: your TTYD_PASSWORD secret"
+          echo "======================================"
+
+          # Keep the workflow running.
+          while kill -0 "$TTYD_PID" 2>/dev/null && \
+                kill -0 "$TUNNEL_PID" 2>/dev/null; do
+            sleep 5
+          done
+
+          echo "A service stopped unexpectedly."
+
+          echo "========== CLOUDFLARE LOGS =========="
+          cat cloudflared.log
+
+          echo "========== PROCESS STATUS =========="
+          ps aux
+
+          exit 1
