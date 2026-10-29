@@ -1,5 +1,5 @@
 
-name: OpenCode Cloud Terminal
+name: OpenCode Cloud Terminal2
 
 on:
   workflow_dispatch:
